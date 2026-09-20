@@ -31,8 +31,23 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     },
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: string } | null;
-    throw new Error(payload?.error ?? `Request failed (${response.status})`);
+    const payload = await response.json().catch(() => null) as {
+      error?: string;
+      title?: string;
+      description?: string;
+      gfnErrorCode?: number;
+    } | null;
+    const error = new Error(payload?.error ?? `Request failed (${response.status})`) as Error & {
+      title?: string;
+      description?: string;
+      gfnErrorCode?: number;
+    };
+    // Surface GFN session error details so the launch error UI can show the
+    // real reason (e.g. "Queue Abandoned") instead of a generic failure.
+    if (payload?.title) error.title = payload.title;
+    if (payload?.description) error.description = payload.description;
+    if (typeof payload?.gfnErrorCode === "number") error.gfnErrorCode = payload.gfnErrorCode;
+    throw error;
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -54,7 +69,7 @@ function readSettings(): Settings {
   try {
     const raw = localStorage.getItem("opennow.web.settings");
     const stored = raw ? JSON.parse(raw) as Partial<Settings> : {};
-    return {
+    const settings: Settings = {
       ...WEB_DEFAULT_SETTINGS,
       ...stored,
       streamClientMode: "web",
@@ -62,6 +77,15 @@ function readSettings(): Settings {
       showNativeStreamerStats: false,
       nativeExternalRenderer: false,
     };
+    // One-time provision of the live stats HUD (GFN-style overlay). Existing
+    // sessions predate the default-on change; respect explicit toggles made
+    // after provisioning.
+    if (settings.statsHudProvisioned !== true) {
+      settings.showStatsOnLaunch = true;
+      settings.statsHudProvisioned = true;
+      writeSettings(settings);
+    }
+    return settings;
   } catch {
     return { ...WEB_DEFAULT_SETTINGS };
   }
@@ -128,10 +152,19 @@ const updaterState = {
 
 const REGION_PING_CONCURRENCY = 6;
 const REGION_PING_TIMEOUT_MS = 6_000;
+/**
+ * Probes per region. The first request on a cold connection pays DNS + TCP +
+ * TLS setup, which inflates the measurement to several round trips (a ~30ms
+ * link reports ~175ms). Warm the connection up, discard that sample, then
+ * time keep-alive requests — each reuses the established connection and
+ * measures roughly one network round trip.
+ */
+const REGION_PING_WARMUP_PROBES = 1;
+const REGION_PING_SAMPLE_PROBES = 3;
 
-async function measureRegionLatency(url: string): Promise<PingResult> {
+async function probeRegionLatencyOnce(url: string, timeoutMs: number): Promise<number> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REGION_PING_TIMEOUT_MS);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const target = new URL(url);
@@ -150,19 +183,43 @@ async function measureRegionLatency(url: string): Promise<PingResult> {
       signal: controller.signal,
     });
 
-    return {
-      url,
-      pingMs: Math.max(1, Math.round(performance.now() - startedAt)),
-    };
-  } catch (error) {
-    return {
-      url,
-      pingMs: null,
-      error: error instanceof Error ? error.message : "Region latency check failed.",
-    };
+    return performance.now() - startedAt;
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+async function measureRegionLatency(url: string): Promise<PingResult> {
+  const samples: number[] = [];
+  let lastError: unknown = null;
+
+  for (let probe = 0; probe < REGION_PING_WARMUP_PROBES + REGION_PING_SAMPLE_PROBES; probe += 1) {
+    try {
+      samples.push(await probeRegionLatencyOnce(url, REGION_PING_TIMEOUT_MS));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (samples.length === 0) {
+    return {
+      url,
+      pingMs: null,
+      error: lastError instanceof Error ? lastError.message : "Region latency check failed.",
+    };
+  }
+
+  // Drop the cold-connection sample whenever at least one keep-alive
+  // sample succeeded, and report the fastest probe (jitter only adds time).
+  const timedSamples = samples.length > REGION_PING_WARMUP_PROBES
+    ? samples.slice(REGION_PING_WARMUP_PROBES)
+    : samples;
+  const bestSample = Math.min(...timedSamples);
+
+  return {
+    url,
+    pingMs: Math.max(1, Math.round(bestSample)),
+  };
 }
 
 async function pingRegionsInBrowser(regions: Parameters<OpenNowApi["pingRegions"]>[0]): Promise<PingResult[]> {
